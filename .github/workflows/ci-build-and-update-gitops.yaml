@@ -1,0 +1,104 @@
+name: CI build image + update app-gitops (Argo CD deploy)
+
+on:
+  push:
+    branches: ["main"]  # 설명: main 브랜치 push에만 실행
+    paths:
+      - "Dockerfile"    # 설명: Dockerfile 변경 시 실행
+      - "index.html"    # 설명: index.html 변경 시 실행
+      - ".github/workflows/ci-build-and-update-gitops.yaml"
+      # 설명: 워크플로우 파일 변경 시에도 실행(테스트 용)
+
+jobs:
+  build_and_update:
+    runs-on: ubuntu-latest  # 설명: GitHub Actions 실행 VM
+
+    env:
+      IMAGE_REPO: app-demo
+      # 설명: Docker Hub 이미지 이름 => <DOCKERHUB_USERNAME>/app-demo:<tag>
+
+      GITOPS_REPO: gjame77/app-gitops
+      # 설명: GitOps 저장소 owner/repo
+
+      DEPLOY_FILE: manifests/deployment.yaml
+      # 설명: GitOps 저장소에서 image 라인을 수정할 파일 경로
+
+    steps:
+      - name: Checkout app-repo
+        uses: actions/checkout@v4
+        # 설명: 현재 app-repo 코드를 가져옴
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        # 설명: docker buildx 빌드 환경 구성(표준)
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}  # 설명: Docker Hub 사용자명(Secrets)
+          password: ${{ secrets.DOCKERHUB_TOKEN }}     # 설명: Docker Hub 토큰(Secrets)
+        # 설명: Docker Hub에 이미지 push하려면 로그인 필요
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .     # 설명: 현재 리포지토리 루트 기준으로 빌드
+          push: true     # 설명: 빌드 후 레지스트리로 push
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_REPO }}:latest
+        # 설명:
+        # - :${{ github.sha }}  => 커밋마다 고유 태그(배포 버전 고정, 운영 표준)
+        # - :latest             => 실습 편의용(항상 최신)
+
+      - name: Checkout app-gitops
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.GITOPS_REPO }}    # 설명: GitOps 저장소 체크아웃 대상
+          token: ${{ secrets.GITOPS_PAT }}      # 설명: GitOps 저장소 push 권한 토큰
+          path: gitops                          # 설명: gitops/ 폴더에 체크아웃
+        # 설명: app-gitops 저장소를 수정/커밋하기 위해 가져옴
+
+      - name: Update image in app-gitops deployment.yaml
+        run: |
+          set -e
+          FILE="gitops/${DEPLOY_FILE}"
+
+          echo "before:"
+          grep -n "image:" "$FILE" || true
+
+          # 설명:
+          # - deployment.yaml의 image: 라인을 강제로 치환
+          # - 결과: image: <DOCKERHUB_USERNAME>/app-demo:<commit_sha>
+          # - 주의: 들여쓰기 포함하여 "          image:" 형태로 덮어씀
+          sed -i "s|^ *image:.*|          image: ${DOCKERHUB_USERNAME}/${IMAGE_REPO}:${GITHUB_SHA}|g" "$FILE"
+
+          echo "after:"
+          grep -n "image:" "$FILE" || true
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}  # 설명: Docker Hub 사용자명
+          IMAGE_REPO: ${{ env.IMAGE_REPO }}                      # 설명: 이미지 repo 이름(app-demo)
+          GITHUB_SHA: ${{ github.sha }}                          # 설명: 현재 커밋 SHA
+
+      - name: Commit and push app-gitops
+        run: |
+          set -e
+          cd gitops
+
+          # 설명: Git 커밋 작성자 설정(Actions 기본)
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+
+          # 설명: 변경사항이 없으면 커밋/푸시하지 않음
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          # 설명: 변경 파일 add → commit → push
+          git add "${DEPLOY_FILE}"
+          git commit -m "deploy: update image to ${GITHUB_SHA}"
+          git push origin main
+        # 설명:
+        # - 여기서 app-gitops에 push가 발생
+        # - Argo CD는 app-gitops 변경을 감지 → 자동 Sync → EKS에 자동 배포
